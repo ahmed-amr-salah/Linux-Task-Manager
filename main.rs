@@ -1,943 +1,414 @@
-mod process;
 mod system;
-extern crate cursive;
-extern crate cursive_table_view;
-use std::cmp::Ordering;
-use std::process::Command;
-use sysinfo::{ProcessExt,Pid, PidExt,SystemExt,CpuExt};
-use sysinfo::System as SysInfoSystem;
-use sysinfo::Process as SysProcess;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-use prettytable::{Table,Row,Cell};
-use crate::system::System as LocalSystem;
-use crate::process::Process;
-use cursive::views::{Dialog, DummyView, EditView, LinearLayout, ScrollView, TextView, TextArea, Button, FixedLayout};
-use cursive::traits::*;
-use cursive::Cursive;
-use cursive_table_view::{TableView, TableViewItem};
-use cursive_core::Rect;
-use fltk::button::Button as FltkButton;
-use fltk::{app, frame::Frame as FltkFrame, prelude::*, window::Window as FltkWindow, group::Group as FltkGroup,input::Input};
-// use fltk::enums::*;
-// use std::cell::RefCell;
-// use std::rc::Rc;
-use fltk::widget_extends;
-// use fltk::draw;
-// use fltk::group::Flex as GroupFlex;
-// use fltk_extras::dial::*;
-// use crossterm::terminal;
-// use crossterm::terminal::Clear;
-// use crossterm::terminal::ClearType;
-use cursive::theme::{BaseColor::*, Color::*, PaletteColor::*};
-use std::io::{self, Write, stdout};
+mod process;
+mod dial;
+use std::path::Path;
+use std::fs;
+use std::io::prelude::*;
+use std::fs::File;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
+use std::collections::HashMap;
+use crate::dial::MyDial;
+use fltk::output::Output;
+use crate::system::System;
+use fltk::{app, /*frame::Frame as FltkFrame*/prelude::*, window::Window as FltkWindow, group::Group as FltkGroup};
+use fltk::{enums::*, /*prelude::**/};
+use fltk::group::Flex as GroupFlex;
+use fltk_extras::dial::*;
+use fltk::misc::Chart as FltkChart;
+use fltk::enums::Color as FltkColor;
+use fltk::misc::ChartType as FltkChartType;
 use std::str::FromStr;
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum BasicColumn {
-    Pid,
-    Name,
-    Cpu,
-    Mem,
-    Status,
-    Cmd,
-    Ppid,
-    User,
-    Priority,
+use fltk::group::{Group, Pack, Tabs};
+use fltk::frame::Frame;
+use fltk::{
+    prelude::*,
+    tree::{Tree, TreeSelect},
+    window::Window,
+};
+//use fltk::menu::Choice as FltkChoice;
+
+#[derive(Clone,Debug)]
+struct ProcessRecord {
+ name: String,
+ pid: i32,
+ ppid: i32,
 }
 
-impl BasicColumn {
-    fn as_str(&self) -> &str {
-        match *self {
-            BasicColumn::Pid => "PID",
-            BasicColumn::Name => "Name",
-            BasicColumn::Cpu => "CPU%",
-            BasicColumn::Mem => "MEM%",
-            BasicColumn::Status => "S",
-            BasicColumn::Cmd => "CMD",
-            BasicColumn::Ppid => "PPID",
-            BasicColumn::User => "User",
-            BasicColumn::Priority => "Priority",
-        }
-    }
+#[derive(Clone,Debug)]
+struct ProcessTreeNode {
+ record: ProcessRecord, // the node owns the associated record
+ children: Vec<ProcessTreeNode>, // nodes own their children
 }
 
-impl TableViewItem<BasicColumn> for Process {
-    fn to_column(&self, column: BasicColumn) -> String {
-        match column {
-            BasicColumn::Name => self.name.to_string(),
-            BasicColumn::Pid => format!("{}", self.pid),
-            BasicColumn::Cpu => format!("{}%", self.cpu),
-            BasicColumn::Cmd => format!("{}", self.command),
-            BasicColumn::Mem => format!("{}%", self.mem_percentage),
-            BasicColumn::Status => format!("{}", self.state),
-            BasicColumn::Ppid => format!("{}", self.ppid.map_or(String::new(), |p| p.to_string())),
-            BasicColumn::User => format!("{}", self.user),
-            BasicColumn::Priority => format!("{}", self.process_priority.to_string()),
-        }
-    }
+#[derive(Clone,Debug)]
+struct ProcessTree {
+ root: ProcessTreeNode, // tree owns ref to root node
+}
 
-    fn cmp(&self, other: &Self, column: BasicColumn) -> Ordering
-    where
-        Self: Sized,
+impl ProcessTreeNode {
+ // constructor
+ fn new(record : &ProcessRecord) -> ProcessTreeNode {
+ ProcessTreeNode { record: (*record).clone(), children: Vec::new() }
+ }
+}
+
+
+// Given a status file path, return a hashmap with the following form:
+// pid -> ProcessRecord
+fn get_process_record(status_path: &Path) -> Option<ProcessRecord> {
+ let mut pid : Option<i32> = None;
+ let mut ppid : Option<i32> = None;
+ let mut name : Option<String> = None;
+
+ let mut reader = std::io::BufReader::new(File::open(status_path).unwrap());
+ loop {
+ let mut linebuf = String::new();
+ match reader.read_line(&mut linebuf) {
+ Ok(_) => {
+ if linebuf.is_empty() {
+ break;
+ }
+ let parts : Vec<&str> = linebuf[..].splitn(2, ':').collect();
+ if parts.len() == 2 {
+ let key = parts[0].trim();
+ let value = parts[1].trim();
+ match key {
+ "Name" => name = Some(value.to_string()),
+ "Pid" => pid = value.parse().ok(),
+ "PPid" => ppid = value.parse().ok(),
+ _ => (),
+ }
+ }
+ },
+ Err(_) => break,
+ }
+ }
+ return if pid.is_some() && ppid.is_some() && name.is_some() {
+ Some(ProcessRecord { name: name.unwrap(), pid: pid.unwrap(), ppid: ppid.unwrap() })
+ } else {
+ None
+ }
+}
+
+
+// build a simple struct (ProcessRecord) for each process
+fn get_process_records() -> Vec<ProcessRecord> {
+ let proc_directory = Path::new("/proc");
+
+ // find potential process directories under /proc
+ let proc_directory_contents = fs::read_dir(&proc_directory).unwrap();
+ proc_directory_contents.filter_map(|entry| {
+ let entry_path = entry.unwrap().path();
+ if fs::metadata(entry_path.as_path()).unwrap().is_dir() {
+ let status_path = entry_path.join("status");
+ if let Ok(metadata) = fs::metadata(status_path.as_path()) {
+ if metadata.is_file() {
+ return get_process_record(status_path.as_path());
+ }
+ }
+ }
+ None
+ }).collect()
+}
+
+fn populate_node_helper(node: &mut ProcessTreeNode, pid_map: &HashMap<i32, &ProcessRecord>, ppid_map: &HashMap<i32, Vec<i32>>) {
+ let pid = node.record.pid; // avoid binding node as immutable in closure
+ let child_nodes = &mut node.children;
+ match ppid_map.get(&pid) {
+ Some(children) => {
+ child_nodes.extend(children.iter().map(|child_pid| {
+ let record = pid_map[child_pid];
+ let mut child = ProcessTreeNode::new(record);
+ populate_node_helper(&mut child, pid_map, ppid_map);
+ child
+ }));
+ },
+ None => {},
+ }
+}
+
+fn populate_node(node : &mut ProcessTreeNode, records: &Vec<ProcessRecord>) {
+ // O(n): build a mapping of pids to vectors of children. That is, each
+ // key is a pid and its value is a vector of the whose parent pid is the key
+ let mut ppid_map : HashMap<i32, Vec<i32>> = HashMap::new();
+ let mut pid_map : HashMap<i32, &ProcessRecord> = HashMap::new();
+ for record in records.iter() {
+ // entry returns either a vacant or occupied entry. If vacant,
+ // we insert a new vector with this records pid. If occupied,
+ // we push this record's pid onto the vec
+ pid_map.insert(record.pid, record);
+ match ppid_map.entry(record.ppid) {
+ Vacant(entry) => { entry.insert(vec![record.pid]); },
+ Occupied(mut entry) => { entry.get_mut().push(record.pid); },
+ };
+ }
+
+ // With the data structures built, it is off to the races
+ populate_node_helper(node, &pid_map, &ppid_map);
+}
+
+fn build_process_tree() -> ProcessTree {
+ let records = get_process_records();
+ let mut tree = ProcessTree {
+ root : ProcessTreeNode::new(
+ &ProcessRecord {
+ name: "/".to_string(),
+ pid: 0,
+ ppid: -1
+ })
+ };
+
+ // recursively populate all nodes in the tree starting from root (pid 0)
+ {
+ let root = &mut tree.root;
+ populate_node(root, &records);
+ }
+ tree
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Message {
+    Increment(),
+    Decrement(),
+}
+
+pub fn inc_frame(d: &mut HalfDial, value: & f32) {
+    d.set_value(*value as i32);
+}
+
+pub fn update_sys_info(d: &mut MyDial, value: & f32) {
+    d.set_value(*value as i32);
+}
+
+pub fn update_sys_info2(d: &mut MyDial, value: & f64) {
+    d.set_value(*value as i32);
+}
+fn main(){
+    let mut curr_system = System::new();
+    let duration = std::time::Duration::from_millis(500);
+    curr_system.update();
+    let a: app::App = app::App::default().with_scheme(app::Scheme::Gtk);
+    let mut wind = FltkWindow::default().with_size(1000, 1000);
+    let tab: Tabs = Tabs::new(10, 10, 1000 - 20, 950 - 20, "");
+    let grp1: Group = Group::new(10, 35, 950 - 20, 500, "CPU Usage\t\t");
+    let CpuDialog: Group = Group::new(15, 55, 950 - 20,200, "CPU Usage\t");
+    let mut frame = Frame::new(15, 70, 960, 150, None);
+    frame.set_color(Color::Black);
+    frame.set_frame(FrameType::BorderFrame);
+    let mut pack = Pack::new(20, 75, 950, 200, "");
+    pack.set_spacing(10);
+    let col = GroupFlex::default()
+        .row()
+        .with_size(950, 130)
+        .with_pos(25,75);
+    let mut dial_list: Vec<HalfDial>;
+    dial_list = vec![];
+    let mut count = 0;
+    for cpu in &curr_system.cpu_core_usages {
+        let text = "CPU ";
+        count = count + 1;
+        let result = text.to_owned() + " " + &count.to_string() + " %";						
+        let mut dial = HalfDial::default();
+        dial_list.push(dial);
+    }
+    let mut val = 0;
+    col.end();
+    pack.end();
+    CpuDialog.end();
+    let graph: Group = Group::new(500, 400, 950, 600, "CPU Usage\t\t").below_of(&CpuDialog,10);
+    let mut chart = FltkChart::default().with_size(950, 570).center_of_parent();
+    chart.set_type(FltkChartType::Fill);
+    chart.set_bounds(0.0, 200.0);
+    chart.set_text_size(18);
+    graph.end();
+    grp1.end();
+    /// /////////////////////////Tree View///////////////////////////////////
+    let grp2: Group = Group::new(10, 35, 1000 - 20, 950 - 45, "Tree\t\t");
+    let ptree = build_process_tree();
+    let mut tree2 = Tree::default().with_size(900,900).center_of_parent();
+    tree2.set_select_mode(TreeSelect::Multi);
+
+    
+    tree2.add(&(ptree.root.record.name));
+
+    let size = ptree.root.children.len();
+    
+    
+    let mut name1;
+    let mut name2;
+
+    let mut name_1;
+    let mut name_2;
+    let added_str = "/" ;
+
+    for i in 0..size
     {
-        match column {
-            BasicColumn::Name => self.name.cmp(&other.name),
-            BasicColumn::Pid => self.pid.cmp(&other.pid),
-            BasicColumn::Cpu => self.cpu.cmp(&other.cpu),
-            BasicColumn::Mem => self.mem_percentage.cmp(&other.mem_percentage),
-            BasicColumn::Status => self.state.cmp(&other.state),
-            BasicColumn::Cmd => self.command.cmp(&other.command),
-            BasicColumn::Ppid => self.ppid.cmp(&other.ppid),
-            BasicColumn::User => self.user.cmp(&other.user),
-            BasicColumn::Priority => (self.process_priority*-1).cmp(&(other.process_priority*-1)),
-        }
-    }
-}
-fn getmoreinfo(s:&usize,t:&mut TableView::<Process, BasicColumn>) -> String
-{
-    let process_info = t.borrow_item(*s).unwrap();
-    let pid = process_info.pid;
-    return pid.to_string();
-}
 
-enum search{
-    PiD,
-    User,
-    PUid,
-    PpPid,
-    Name,
-}
+        name1 = (ptree.root.children[i].record.name).clone();
 
-enum filter{
-    Cpu,
-    Mem,
-    Threads,
-    FdCount,  
-}
+        name_1 = name1.replace("/","");
 
-enum options{
-    Greater,
-    Less,
-    Range,
-}
+        
+        tree2.add(&(name_1)); 
+     
+        
+        let sub_size = ptree.root.children[i].children.len();
+        
 
-fn kill_process(s: &mut Cursive,pid: Pid) {
-    let system = SysInfoSystem::new_all();
-    if let Some(process) = system.process(pid) {
-        if process.kill() {
-            s.add_layer(Dialog::around(
-                LinearLayout::vertical()
-                    .child(TextView::new("Process killed successfully."),
-                ))
-                .button("Close", move |s| {
-                    s.pop_layer();
-                }),
-        );
-        }
-        else{
-            s.add_layer(Dialog::around(
-                LinearLayout::vertical()
-                    .child(TextView::new("Process couldn't be killed or Process not found! Please enter correct pid."),
-                ))
-                .button("Close", move |s| {
-                    s.pop_layer();
-                }),
-        );
-    }
-}
-    else{
-        s.add_layer(Dialog::around(
-            LinearLayout::vertical()
-                .child(TextView::new("Process not found! Please enetr correct pid."),
-            ))
-            .button("Close", move |s| {
-                s.pop_layer();
-            }),
-    );
-    }
-}
-
-fn show_popup(s: &mut Cursive, name: &str) {
-    let mut command: &str = " ";
-    let mut first: &str = " ";
-    let mut second: &str = " ";
-    let mut third: &str = " ";
-    let mut fourth: &str = " ";
-
-    if name.is_empty() {
-        s.add_layer(Dialog::info("Please enter a command! For help, enter show -help"));
-    } else {
-        let args: Vec<&str> = name.split_whitespace().collect();
-        if args.len() == 3 {
-        command = args[0];
-        first = args[1];
-        second = args[2];
-        third = " ";
-        fourth = " ";
-        }
-        else if args.len() == 2 {
-            command = args[0];
-            first = args[1];
-            second = " ";
-        }
-        else if args.len() == 4
+        for j in 0..sub_size
         {
-            command = args[0];
-            first = args[1];
-            second = args[2];
-            third = args[3];
-            fourth = " ";
-        }
-        else if args.len() == 5
-        {
-            command = args[0];
-            first = args[1];
-            second = args[2];
-            third = args[3];
-            fourth = args[4];
-        }
-        else {
-            let help = "Incorrect command. Please enter one of the following available commands:".to_owned() +  &"\n".to_owned()
-            + &"To show full table, enter: show full table".to_owned()
-            + &"To kill a process, enter: kill -pid [process pid]".to_owned()
-            + &"\n".to_owned() + &"Options to search for a process: ".to_owned() + &"\n".to_owned()
-            + &"1- search -pid [process pid]".to_owned() + &"\n".to_owned() + &"2- search -uid [process uid]".to_owned()
-            + &"\n".to_owned() + &"3- search -user [user]".to_owned() + &"\n".to_owned() + &"4- search -name [process name]".to_owned() + &"\n".to_owned() + &"5- search -ppid [process parent id]".to_owned()
-            + &"\n".to_owned() + &"Options to filter processes: ".to_owned() + &"\n".to_owned()
-            + &"1- filter -cpu -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"2- filter -cpu -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"3- filter -mem -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"4- filter -mem -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"5- filter -threads -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"6- filter -threads -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"7- filter -fd -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"8- filter -fd -range [minimum value] [maximum value]".to_owned();
-            s.add_layer(
-                Dialog::around(
-                    LinearLayout::vertical()
-                        .child(TextView::new(&help),
-                    ))
-                    .button("Close", move |s| {
-                        s.pop_layer();
-                    }),
-            );
-            command = " ";
-            first = " ";
-            second = " ";
-        }
-    }
-        if name == "show full table"{
-            show_complete_view();
-        }
-        else if command == "search" && first == "-user" {
-            show_search_view(search::User, (&second).to_string());
-        }
-        else if command == "search" && first == "-uid" {
-            show_search_view(search::PUid, (&second).to_string());
-        }
-        else if command == "search" && first == "-name" {
-            show_search_view(search::Name, (&second).to_string());
-        }
-        else if command == "search" && first == "-pid" {
-            show_search_view(search::PiD, (&second).to_string());
-        }
-        else if command == "search" && first == "-ppid" {
-            show_search_view(search::PpPid, (&second).to_string());
-        }
-        else if command == "kill" && first == "-pid" {
-            let mut system = SysInfoSystem::new_all();
-            system.refresh_all();
-            let processes_list: Vec<Process> = system.processes().iter()
-            .map(|(_, process)|
-                Process::new(process,&system)
-            )
-            .collect();
-            for prc in processes_list{
-                if prc.pid.to_string() == (&second).to_string() {
-                    kill_process(s,prc.piddd);
+            name2 = (&(ptree.root.children[i].children[j].record.name).clone()).to_string();
+            
+            
+            name_2 = name2.replace("/","");
+
+            
+
+            name_1.push_str(added_str);
+            name_1.push_str(&name_2);
+
+
+            
+            tree2.add(&(name_1));
+
+            
+
+            if(ptree.root.children[i].children[j].children.len()) != 0
+            {
+                let extra_size = ptree.root.children[i].children[j].children.len();
+
+                for k in 0..extra_size
+                {
+                    name2 = (&(ptree.root.children[i].children[j].children[k].record.name).clone()).to_string();
+                    
+                    
+                    name_2 = name2.replace("/", "");
+
+
+                    name_1.push_str(added_str);
+                    name_1.push_str(&name_2);
+
+                    tree2.add(&(name_1));
+
+                    name_1 = (&(ptree.root.children[i].children[j].record.name).clone()).to_string();
                 }
             }
-        }
-        else if command == "filter" && first == "-greater" && second == "-cpu" {
-            show_filtered_view(filter::Cpu,options::Greater,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-less" && second == "-cpu" {
-            show_filtered_view(filter::Cpu,options::Less,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-range" && second == "-cpu" {
-            show_filtered_view(filter::Cpu,options::Range,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-greater" && second == "-mem" {
-            show_filtered_view(filter::Mem,options::Greater,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-less" && second == "-mem" {
-            show_filtered_view(filter::Mem,options::Less,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-range" && second == "-mem" {
-            show_filtered_view(filter::Mem,options::Range,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-greater" && second == "-threads" {
-            show_filtered_view(filter::Threads,options::Greater,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-less" && second == "-threads" {
-            show_filtered_view(filter::Threads,options::Less,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-range" && second == "-threads" {
-            show_filtered_view(filter::Threads,options::Range,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-greater" && second == "-fd" {
-            show_filtered_view(filter::FdCount,options::Greater,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-less" && second == "-fd" {
-            show_filtered_view(filter::FdCount,options::Less,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "filter" && first == "-range" && second == "-fd" {
-            show_filtered_view(filter::FdCount,options::Range,(&third).to_string(),(&fourth).to_string());
-        }
-        else if command == "show" && first == "-help" {
-            let help = "Incorrect command. Please enter one of the following available commands:".to_owned() +  &"\n".to_owned()
-            + &"To show full table, enter: show full table".to_owned()
-            + &"To kill a process, enter: kill -pid [process pid]".to_owned()
-            + &"\n".to_owned() + &"Options to search for a process: ".to_owned() + &"\n".to_owned()
-            + &"1- search -pid [process pid]".to_owned() + &"\n".to_owned() + &"2- search -uid [process uid]".to_owned()
-            + &"\n".to_owned() + &"3- search -user [user]".to_owned() + &"\n".to_owned() + &"4- search -name [process name]".to_owned() + &"\n".to_owned() + &"5- search -ppid [process parent id]".to_owned()
-            + &"\n".to_owned() + &"Options to filter processes: ".to_owned() + &"\n".to_owned()
-            + &"1- filter -cpu -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"2- filter -cpu -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"3- filter -mem -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"4- filter -mem -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"5- filter -threads -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"6- filter -threads -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"7- filter -fd -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"8- filter -fd -range [minimum value] [maximum value]".to_owned();
-
-            s.add_layer(
-                Dialog::around(
-                    LinearLayout::vertical()
-                        .child(TextView::new(&help),
-                    ))
-                    .button("Close", move |s| {
-                        s.pop_layer();
-                    }),
-            );
-        }
-        else {
-            let help = "Incorrect command. Please enter one of the following available commands:".to_owned() +  &"\n".to_owned()
-            + &"To show full table, enter: show full table".to_owned()
-            + &"To kill a process, enter: kill -pid [process pid]".to_owned()
-            + &"\n".to_owned() + &"Options to search for a process: ".to_owned() + &"\n".to_owned()
-            + &"1- search -pid [process pid]".to_owned() + &"\n".to_owned() + &"2- search -uid [process uid]".to_owned()
-            + &"\n".to_owned() + &"3- search -user [user]".to_owned() + &"\n".to_owned() + &"4- search -name [process name]".to_owned() + &"\n".to_owned() + &"5- search -ppid [process parent id]".to_owned()
-            + &"\n".to_owned() + &"Options to filter processes: ".to_owned() + &"\n".to_owned()
-            + &"1- filter -cpu -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"2- filter -cpu -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"3- filter -mem -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"4- filter -mem -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"5- filter -threads -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"6- filter -threads -range [minimum value] [maximum value]".to_owned()
-            + &"\n".to_owned() + &"7- filter -fd -[greater, less] [value]".to_owned() + &"\n".to_owned() + &"8- filter -fd -range [minimum value] [maximum value]".to_owned();
-            s.add_layer(
-                Dialog::around(
-                    LinearLayout::vertical()
-                        .child(TextView::new(&help),
-                    ))
-                    .button("Close", move |s| {
-                        s.pop_layer();
-                    }),
-            );
-        }
-}
-
-fn show_complete_view(){
-    let mut palette = cursive::theme::Palette::default();
-    palette[Background] =Dark(Black);
-    palette[Shadow] = Dark(Black); 
-    palette[View] = Dark(Black);
-    palette[Primary] = Light(Green);
-    palette[Secondary] = Light(Green);
-    palette[Tertiary] = Light(Green);
-    palette[TitlePrimary] = Light(Green);
-    palette[TitleSecondary] = Light(Green);
-    palette[Highlight] = Dark(White);
-    palette[HighlightInactive] = Dark(White);
-    palette[HighlightText] = Dark(Green);   
-    let theme = cursive::theme::Theme{
-        shadow: true,
-        borders: cursive::theme::BorderStyle::None,
-        palette: palette,
-    };
-        let mut system = SysInfoSystem::new_all();
-        system.refresh_all();
-        let mut fill_siv = cursive::default();
-        let mut table = TableView::<Process, BasicColumn>::new()
-            .column(BasicColumn::Name, "Name", |c| c.width_percent(10))
-            .column(BasicColumn::Pid, "PID", |c| c.width_percent(4))
-            .column(BasicColumn::Cpu, "CPU%", |c| c.width_percent(7))
-            .column(BasicColumn::Cmd, "CMD", |c| c.width_percent(20))
-            .column(BasicColumn::Mem, "MEM%", |c| c.width_percent(10))
-            .column(BasicColumn::Status, "S", |c| c.width_percent(10))
-            .column(BasicColumn::Ppid, "PPID", |c| c.width_percent(7))
-            // .column(BasicColumn::Uid, "UID", |c| c.width_percent(5))
-            .column(BasicColumn::User, "User", |c| c.width_percent(10))
-            .column(BasicColumn::Priority, "Prioirty", |c| c.width_percent(23));
-            // .column(BasicColumn::FdCount, "FdCount", |c| c.width_percent(5))
-            // .column(BasicColumn::Threads, "Threads", |c| c.width_percent(5));
-        let mut items = Vec::new();
-        items = system.processes()
-        .iter()
-        .map(|(_, process)|
-            Process::new(process,&system)
-        )
-        .collect();
-        table.set_on_sort(|fill_siv: &mut Cursive, column: BasicColumn, order: Ordering| {
-            fill_siv.add_layer(
-                Dialog::around(TextView::new(format!("{} / {:?}", column.as_str(), order)))
-                    .title("Sorted by")
-                    .button("Close", |s| {
-                        s.pop_layer();
-                    }),
-            );
-        });
-    
-        table.set_on_submit(|siv: &mut Cursive, row: usize, index: usize| {
-            let mut processes_info = String::new();
-            let value = siv
-                .call_on_name("table",|table: &mut TableView<Process, BasicColumn>| {
-                    table.borrow_item(index);
-                    let pid_value = &getmoreinfo(&index,table);
-                    let mut system_extra = SysInfoSystem::new_all();
-                    system_extra.refresh_all();
-                    let mut processes_list: Vec<Process>;
-                    processes_list = system_extra.processes()
-                    .iter()
-                    .map(|(_, process)|
-                        Process::new(process,&system_extra)
-                    )
-                    .collect();
-
-                    for prc in &processes_list{
-                        if prc.pid.to_string() == pid_value.to_string() {
-                            processes_info = "Pid:".to_owned()+&prc.pid.to_string()+&"    Uid:".to_owned()+&prc.p_u_id.to_string()+&"    User: ".to_owned()+&prc.user.to_string() + &"    Num of. Threads: ".to_owned()+&prc.threads.to_string() + &"\n".to_owned()
-                            + &"Num of. open files (fd): ".to_owned()+&prc.fd_count.to_string()+ &"     Priority: ".to_owned()+&prc.process_priority.to_string() + &"\n".to_owned()
-                            + &"Disk Writes (Bytes): ".to_owned()+&prc.disk_written.to_string() + &"    Disk Reads (Bytes): ".to_owned()+&prc.disk_read.to_string() +&"     Memory (RAM) used (Bytes): ".to_owned()+&prc.mem.to_string() 
-                        }
-                    }
-                })
-                .unwrap();
             
-            siv.add_layer(
-                Dialog::around(
-                    LinearLayout::vertical()
-                        .child(TextView::new(&processes_info),
-                    ))
-                    .button("Close", move |s| {
-                        s.pop_layer();
-                    }),
-            );
-        });
 
-        fill_siv.add_layer(
-            Dialog::around(
-                LinearLayout::vertical()
-                    .child(TextView::new(" ").with_name("System Information"))
-                    .child(DummyView.fixed_height(2))
-                    .child(table.with_name("table").min_size((200, 30)))
-                    .child(DummyView.fixed_height(2))
-                    .child(EditView::new()
-                    .on_submit_mut(show_popup)
-                    .with_name("name")
-                    .fixed_width(200)),
-            ));
-            let duration = std::time::Duration::from_millis(1000);
-            let cb_sink = fill_siv.cb_sink().clone();
-            let handle = std::thread::spawn(move || {
-            let mut updated_sys = SysInfoSystem::new_all();
-            let vector_process = updated_sys.processes();
-            let mut system_info = LocalSystem::new();
-            let mut sys_info_str = String::new();
-                loop{
-                        // system.update();
-                        // let mut items2 = system.processes.clone();
-                        system_info.update();
-                        updated_sys.refresh_all();
-                        let vector_process = updated_sys.processes()
-                        .iter()
-                        .map(|(_, process)|
-                            Process::new(process,&updated_sys)
-                        )
-                        .collect();
-                        sys_info_str = "Processes: ".to_owned()+&system_info.processes.len().to_string()+ &"    Total Memory:".to_owned()+&system_info.mem_total.to_string()+&"    Used Memory:".to_owned()+&system_info.mem_used.to_string()+&"    Available Memory:".to_owned()+&system_info.mem_available.to_string() + &"\n".to_owned()
-                        + &"Processors: ".to_owned()+&system_info.cpu_num_cores.to_string() + &"    Disks: ".to_owned()+&system_info.disks_num.to_string() +&"    Total Swap: ".to_owned()+&system_info.total_swap.to_string() + &"   Free Swap: ".to_owned()+&system_info.free_swap.to_string() + &"     Used Swap: ".to_owned()+&system_info.used_swap.to_string()
-                        + &"\n".to_owned() + &"Load Average : ".to_owned()+&system_info.load_avg.to_string();
+            name_1 = (ptree.root.children[i].record.name).clone();
 
-                        std::thread::sleep(duration);
-                        cb_sink
-                            .send(Box::new(move |s| {
-                                s.call_on_name("table", |v: &mut TableView::<Process, BasicColumn>| {
-                                    v.set_items(vector_process)
-                                });
-                            }))
-                            .unwrap();
-                        cb_sink
-                        .send(Box::new(move |s| {
-                            s.call_on_name("System Information", |v: &mut TextView| {
-                                v.set_content(sys_info_str)
-                            });
-                        }))
-                        .unwrap();
-                        }
-                });
-                fill_siv.set_theme(theme);
-                fill_siv.run();
-}
+        }
+    }
+    tree2.set_trigger(fltk::enums::CallbackTrigger::ReleaseAlways);
+    grp2.end();
+    ///////////////////////////System Overview/////////////////////////////////////
+    let grp4: Group = Group::new(10, 35, 1000 - 20, 950 - 45, "System Overview\t\t");
+    let grp5: Group = Group::new(15, 60, 960, 250, "System Information \t\t");
+    let mut frame2 = Frame::new(15, 70, 960, 200, None);
+    frame2.set_color(Color::Black);
+    frame2.set_frame(FrameType::BorderFrame);
+    //first dial 
+    let mut dial1 = MyDial::new(50,110, 200, 200, "CPU Load %");
+    dial1.set_label_size(22);
+    dial1.set_label_color(Color::from_u32(0x797979));
+    //second dial 
+    let mut dial2 = MyDial::new(375, 110, 200, 200, "Total Memory %");
+    dial2.set_label_size(22);
+    dial2.set_label_color(Color::from_u32(0x797979));
+    //thrid dial
+    let mut dial3 = MyDial::new(700, 110, 200, 200, "Total Disk%");
+    dial3.set_label_size(22);
+    dial3.set_label_color(Color::from_u32(0x797979));
+    //Memory Graph
+    let Memorygraph: Group = Group::new(500, 500, 950, 450, "Memory Consumption\t\t").below_of(&grp5,10);
+    let mut chart2 = FltkChart::default().with_size(950, 450).center_of_parent();
+    chart2.set_type(FltkChartType::Pie);
+    chart2.set_bounds(0.0, 100.0);
+    chart2.set_text_size(18);
+    Memorygraph.end();
+    let mut msg: Output = Output::new(500,950,950,50,"").below_of(&Memorygraph,5);
+    msg.set_color(FltkColor::from_u32(0xB2BEB5));
+    msg.set_value(" Light Blue --> Memory Used                            Blue--> Memory Remaning                         Yellow: Memory available   ");
+    grp5.end();
+    grp4.end();
+    ///////////////////////////////////////////////////////////////////////////////
+    /////////////////////////////////////Tab 4////////////////////////////////////
+    let Processes: Group = Group::new(10, 35, 1000 - 20, 950 - 45, "Processes Info\t\t");
+    let grp10: Group = Group::new(15, 60, 950, 900, "Running Processes \t\t");
+    let mut chart4 = FltkChart::default().with_size(950,850).center_of_parent();
+    chart4.set_type(FltkChartType::Pie);
+    chart4.set_bounds(0.0, 100.0);
+    chart4.set_text_size(18);
+    grp10.end();
+    Processes.end();
 
-fn show_search_view(criteria: search, value: String)
-{
-    let mut palette = cursive::theme::Palette::default();
-    palette[Background] =Dark(Black);
-    palette[Shadow] = Dark(Black); 
-    palette[View] = Dark(Black);
-    palette[Primary] = Light(Green);
-    palette[Secondary] = Light(Green);
-    palette[Tertiary] = Light(Green);
-    palette[TitlePrimary] = Light(Green);
-    palette[TitleSecondary] = Light(Green);
-    palette[Highlight] = Dark(White);
-    palette[HighlightInactive] = Dark(White);
-    palette[HighlightText] = Dark(Green);   
-    let theme = cursive::theme::Theme{
-        shadow: true,
-        borders: cursive::theme::BorderStyle::None,
-        palette: palette,
-    };
-        let mut system = SysInfoSystem::new_all();
-        system.refresh_all();
-        let mut search_siv = cursive::default();
-        let mut table = TableView::<Process, BasicColumn>::new()
-            .column(BasicColumn::Name, "Name", |c| c.width_percent(10))
-            .column(BasicColumn::Pid, "PID", |c| c.width_percent(4))
-            .column(BasicColumn::Cpu, "CPU%", |c| c.width_percent(7))
-            .column(BasicColumn::Cmd, "CMD", |c| c.width_percent(20))
-            .column(BasicColumn::Mem, "MEM%", |c| c.width_percent(10))
-            .column(BasicColumn::Status, "S", |c| c.width_percent(10))
-            .column(BasicColumn::Ppid, "PPID", |c| c.width_percent(7))
-            .column(BasicColumn::User, "User", |c| c.width_percent(10))
-            .column(BasicColumn::Priority, "Prioirty", |c| c.width_percent(23));
-        let mut items = Vec::new();
-        items = system.processes()
-        .iter()
-        .map(|(_, process)|
-            Process::new(process,&system)
-        )
-        .collect();
-
-        table.set_on_sort(|search_siv: &mut Cursive, column: BasicColumn, order: Ordering| {
-            search_siv.add_layer(
-                Dialog::around(TextView::new(format!("{} / {:?}", column.as_str(), order)))
-                    .title("Sorted by")
-                    .button("Close", |s| {
-                        s.pop_layer();
-                    }),
-            );
-        });
-    
-        table.set_on_submit(|siv: &mut Cursive, row: usize, index: usize| {
-            let mut processes_info = String::new();
-            let value = siv
-                .call_on_name("table",|table: &mut TableView<Process, BasicColumn>| {
-                    table.borrow_item(index);
-                    let pid_value = &getmoreinfo(&index,table);
-                    let mut system_extra = SysInfoSystem::new_all();
-                    system_extra.refresh_all();
-                    let processes_list: Vec<Process>;
-                    processes_list = system_extra.processes()
-                    .iter()
-                    .map(|(_, process)|
-                        Process::new(process,&system_extra)
-                    )
-                    .collect();
-
-                    for prc in &processes_list{
-                        if prc.pid.to_string() == pid_value.to_string() {
-                            processes_info = "Pid:".to_owned()+&prc.pid.to_string()+&"    Uid:".to_owned()+&prc.p_u_id.to_string()+&"    User: ".to_owned()+&prc.user.to_string() + &"    Num of. Threads: ".to_owned()+&prc.threads.to_string() + &"\n".to_owned()
-                            + &"Num of. open files (fd): ".to_owned()+&prc.fd_count.to_string()+ &"     Priority: ".to_owned()+&prc.process_priority.to_string() + &"\n".to_owned()
-                            + &"Disk Writes (Bytes): ".to_owned()+&prc.disk_written.to_string() + &"    Disk Reads (Bytes): ".to_owned()+&prc.disk_read.to_string() +&"     Memory (RAM) used (Bytes): ".to_owned()+&prc.mem.to_string() 
-                        }
-                    }
-                })
-                .unwrap();
-            
-            siv.add_layer(
-                Dialog::around(
-                    LinearLayout::vertical()
-                        .child(TextView::new(&processes_info),
-                    ))
-                    .button("Close", move |s| {
-                        s.pop_layer();
-                    }),
-            );
-        });
-    
-        search_siv.add_layer(
-            Dialog::around(
-                LinearLayout::vertical()
-                    .child(TextView::new(" ").with_name("System Information"))
-                    .child(DummyView.fixed_height(2))
-                    .child(table.with_name("table").min_size((200, 30)))
-                    .child(DummyView.fixed_height(2))
-                    .child(EditView::new()
-                    .on_submit_mut(show_popup)
-                    .with_name("name")
-                    .fixed_width(200)),
-            ));
-            let duration = std::time::Duration::from_millis(1000);
-            let cb_sink = search_siv.cb_sink().clone();
-            let value2 = value;
-            let handle = std::thread::spawn(move || {
-            let mut updated_sys2 = SysInfoSystem::new_all();
-            let mut vector_process2:Vec<Process>;
-            let mut system_info = LocalSystem::new();
-            let mut sys_info_str = String::new();
-                loop{
-                        updated_sys2.refresh_all();
-                        system_info.update();
-                        vector_process2 = updated_sys2.processes()
-                        .iter()
-                        .map(|(_, process)|
-                            Process::new(process,&updated_sys2)
-                        )
-                        .collect();
-                        sys_info_str = "Processes: ".to_owned()+&system_info.processes.len().to_string()+ &"    Total Memory:".to_owned()+&system_info.mem_total.to_string()+&"    Used Memory:".to_owned()+&system_info.mem_used.to_string()+&"    Available Memory:".to_owned()+&system_info.mem_available.to_string() + &"\n".to_owned()
-                        + &"Processors: ".to_owned()+&system_info.cpu_num_cores.to_string() + &"    Disks: ".to_owned()+&system_info.disks_num.to_string() +&"    Total Swap: ".to_owned()+&system_info.total_swap.to_string() + &"   Free Swap: ".to_owned()+&system_info.free_swap.to_string() + &"     Used Swap: ".to_owned()+&system_info.used_swap.to_string()
-                        + &"\n".to_owned() + &"Load Average : ".to_owned()+&system_info.load_avg.to_string();                        match criteria {
-                            search::PiD => {
-                                let n: u32 = FromStr::from_str(&value2).unwrap();
-                                vector_process2 = vector_process2
-                                .into_iter()
-                                .filter(|r| r.pid == n)
-                                .collect();
-                            },
-                            search::PUid => {
-                                vector_process2 = vector_process2
-                                .into_iter()
-                                .filter(|r| r.p_u_id == value2.to_string())
-                                .collect();
-                            },
-                            search::PpPid => {
-                                vector_process2 = vector_process2
-                                .into_iter()
-                                .filter(|r| r.ppid.unwrap().to_string() == value2.to_string())
-                                .collect();
-                            },
-                            search::User => {
-                                vector_process2 = vector_process2
-                                .into_iter()
-                                .filter(|r| r.user.contains(&value2.to_string()))
-                                .collect();
-                            },
-                            search::Name => {
-                                vector_process2 = vector_process2
-                                .into_iter()
-                                .filter(|r| r.name.contains(&value2.to_string()))
-                                .collect();
-                            },
-                        }
-                        std::thread::sleep(duration);
-                        cb_sink
-                            .send(Box::new(move |s| {
-                                s.call_on_name("table", |v: &mut TableView::<Process, BasicColumn>| {
-                                    v.set_items(vector_process2)
-                                });
-                            }))
-                            .unwrap();
-                            cb_sink
-                        .send(Box::new(move |s| {
-                            s.call_on_name("System Information", |v: &mut TextView| {
-                                v.set_content(sys_info_str)
-                            });
-                        }))
-                        .unwrap();
-                        }
-                });
-            search_siv.set_theme(theme);
-            search_siv.run();
-}
-
-fn show_filtered_view(criteria: filter, option_criteria: options, value: String, value2: String)
-{
-    let mut palette = cursive::theme::Palette::default();
-    palette[Background] =Dark(Black);
-    palette[Shadow] = Dark(Black); 
-    palette[View] = Dark(Black);
-    palette[Primary] = Light(Green);
-    palette[Secondary] = Light(Green);
-    palette[Tertiary] = Light(Green);
-    palette[TitlePrimary] = Light(Green);
-    palette[TitleSecondary] = Light(Green);
-    palette[Highlight] = Dark(White);
-    palette[HighlightInactive] = Dark(White);
-    palette[HighlightText] = Dark(Green);    
-    let theme = cursive::theme::Theme{
-        shadow: true,
-        borders: cursive::theme::BorderStyle::None,
-        palette: palette,
-    };
-        let mut system = SysInfoSystem::new_all();
-        system.refresh_all();
-        let mut search_siv = cursive::default();
-        let mut table = TableView::<Process, BasicColumn>::new()
-            .column(BasicColumn::Name, "Name", |c| c.width_percent(10))
-            .column(BasicColumn::Pid, "PID", |c| c.width_percent(4))
-            .column(BasicColumn::Cpu, "CPU%", |c| c.width_percent(7))
-            .column(BasicColumn::Cmd, "CMD", |c| c.width_percent(20))
-            .column(BasicColumn::Mem, "MEM%", |c| c.width_percent(10))
-            .column(BasicColumn::Status, "S", |c| c.width_percent(10))
-            .column(BasicColumn::Ppid, "PPID", |c| c.width_percent(7))
-            // .column(BasicColumn::Uid, "UID", |c| c.width_percent(5))
-            .column(BasicColumn::User, "User", |c| c.width_percent(10))
-            .column(BasicColumn::Priority, "Prioirty", |c| c.width_percent(23));
-            // .column(BasicColumn::FdCount, "FdCount", |c| c.width_percent(5))
-            // .column(BasicColumn::Threads, "Threads", |c| c.width_percent(5));
-        let mut items = Vec::new();
-        items = system.processes()
-        .iter()
-        .map(|(_, process)|
-            Process::new(process,&system)
-        )
-        .collect();
-
-        table.set_on_sort(|search_siv: &mut Cursive, column: BasicColumn, order: Ordering| {
-            search_siv.add_layer(
-                Dialog::around(TextView::new(format!("{} / {:?}", column.as_str(), order)))
-                    .title("Sorted by")
-                    .button("Close", |s| {
-                        s.pop_layer();
-                    }),
-            );
-        });
-    
-        table.set_on_submit(|siv: &mut Cursive, row: usize, index: usize| {
-            let mut processes_info = String::new();
-            let value = siv
-                .call_on_name("table",|table: &mut TableView<Process, BasicColumn>| {
-                    table.borrow_item(index);
-                    let pid_value = &getmoreinfo(&index,table);
-                    let mut system_extra = SysInfoSystem::new_all();
-                    system_extra.refresh_all();
-                    let processes_list: Vec<Process>;
-                    processes_list = system_extra.processes()
-                    .iter()
-                    .map(|(_, process)|
-                        Process::new(process,&system_extra)
-                    )
-                    .collect();
-
-                    for prc in &processes_list{
-                        if prc.pid.to_string() == pid_value.to_string() {
-                            processes_info = "Pid:".to_owned()+&prc.pid.to_string()+&"    Uid:".to_owned()+&prc.p_u_id.to_string()+&"    User: ".to_owned()+&prc.user.to_string() + &"    Num of. Threads: ".to_owned()+&prc.threads.to_string() + &"\n".to_owned()
-                            + &"Num of. open files (fd): ".to_owned()+&prc.fd_count.to_string()+ &"     Priority: ".to_owned()+&prc.process_priority.to_string() + &"\n".to_owned()
-                            + &"Disk Writes (Bytes): ".to_owned()+&prc.disk_written.to_string() + &"    Disk Reads (Bytes): ".to_owned()+&prc.disk_read.to_string() +&"     Memory (RAM) used (Bytes): ".to_owned()+&prc.mem.to_string() 
-                        }
-                    }
-                })
-                .unwrap();
-            
-            siv.add_layer(
-                Dialog::around(
-                    LinearLayout::vertical()
-                        .child(TextView::new(&processes_info),
-                    ))
-                    .button("Close", move |s| {
-                        s.pop_layer();
-                    }),
-            );
-        });
-    
-        search_siv.add_layer(
-            Dialog::around(
-                LinearLayout::vertical()
-                    .child(TextView::new(" ").with_name("System Information"))
-                    .child(DummyView.fixed_height(2))
-                    .child(table.with_name("table").min_size((200, 30)))
-                    .child(DummyView.fixed_height(2))
-                    .child(EditView::new()
-                    .on_submit_mut(show_popup)
-                    .with_name("name")
-                    .fixed_width(200)),
-            ));
-            let duration = std::time::Duration::from_millis(1000);
-            let cb_sink = search_siv.cb_sink().clone();
-            let value3 = value;
-            let value4 = value2;
-            let handle = std::thread::spawn(move || {
-            let mut updated_sys2 = SysInfoSystem::new_all();
-            let mut vector_process2:Vec<Process>;
-            let mut system_info = LocalSystem::new();
-            let mut sys_info_str = String::new();
-                loop{
-                        updated_sys2.refresh_all();
-                        system_info.update();
-                        vector_process2 = updated_sys2.processes()
-                        .iter()
-                        .map(|(_, process)|
-                            Process::new(process,&updated_sys2)
-                        )
-                        .collect();
-                        sys_info_str = "Processes: ".to_owned()+&system_info.processes.len().to_string()+ &"    Total Memory:".to_owned()+&system_info.mem_total.to_string()+&"    Used Memory:".to_owned()+&system_info.mem_used.to_string()+&"    Available Memory:".to_owned()+&system_info.mem_available.to_string() + &"\n".to_owned()
-                        + &"Processors: ".to_owned()+&system_info.cpu_num_cores.to_string() + &"    Disks: ".to_owned()+&system_info.disks_num.to_string() +&"    Total Swap: ".to_owned()+&system_info.total_swap.to_string() + &"   Free Swap: ".to_owned()+&system_info.free_swap.to_string() + &"     Used Swap: ".to_owned()+&system_info.used_swap.to_string()
-                        + &"\n".to_owned() + &"Load Average : ".to_owned()+&system_info.load_avg.to_string();
-                        match criteria {
-                            filter::Cpu => {
-                                let n: f32 = FromStr::from_str(&value3).unwrap();
-                                let n2: f32;
-                                if value4 != " " {
-                                    n2 = FromStr::from_str(&value4).unwrap();
-                                }
-                                else{
-                                    n2 = 0.0;
-                                }
-                                match option_criteria{
-                                    options::Greater =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.cpu.parse::<f32>().unwrap() > n)
-                                        .collect();
-                                    }
-                                    options::Less =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.cpu.parse::<f32>().unwrap() < n)
-                                        .collect();
-                                    }
-                                    options::Range =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.cpu.parse::<f32>().unwrap() > n && r.cpu.parse::<f32>().unwrap() < n2)
-                                        .collect();
-                                    }
-                                }
-                            },
-                            filter::Mem => {
-                                let n: f32 = FromStr::from_str(&value3).unwrap();
-                                let n2: f32;
-                                if value4 != " " {
-                                    n2 = FromStr::from_str(&value4).unwrap();
-                                }
-                                else{
-                                    n2 = 0.0;
-                                }
-                                match option_criteria{
-                                    options::Greater =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.mem_percentage.parse::<f32>().unwrap() > n)
-                                        .collect();
-                                    }
-                                    options::Less =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.mem_percentage.parse::<f32>().unwrap() < n)
-                                        .collect();
-                                    }
-                                    options::Range =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.mem_percentage.parse::<f32>().unwrap() > n && r.mem_percentage.parse::<f32>().unwrap() < n2)
-                                        .collect();
-                                    }
-                                }
-                            },
-                            filter::Threads => {
-                                let n: u64 = FromStr::from_str(&value3).unwrap();
-                                let n2: u64;
-                                if value4 != " " {
-                                    n2 = FromStr::from_str(&value4).unwrap();
-                                }
-                                else{
-                                    n2 = 0;
-                                }
-                                match option_criteria{
-                                    options::Greater =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.threads > n)
-                                        .collect();
-                                    }
-                                    options::Less =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.threads < n)
-                                        .collect();
-                                    }
-                                    options::Range =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.threads > n && r.threads < n2)
-                                        .collect();
-                                    }
-                                }
-                            },
-                            filter::FdCount => {
-                                let n: usize = FromStr::from_str(&value3).unwrap();
-                                let n2: usize;
-                                if value4 != " " {
-                                    n2 = FromStr::from_str(&value4).unwrap();
-                                }
-                                else{
-                                    n2 = 0;
-                                }
-                                match option_criteria{
-                                    options::Greater =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.fd_count > n)
-                                        .collect();
-                                    }
-                                    options::Less =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.fd_count < n)
-                                        .collect();
-                                    }
-                                    options::Range =>
-                                    {
-                                        vector_process2 = vector_process2
-                                        .into_iter()
-                                        .filter(|r| r.fd_count > n && r.fd_count < n2)
-                                        .collect();
-                                    }
-                                }
-                            },
-                        }
-                        std::thread::sleep(duration);
-                        cb_sink
-                            .send(Box::new(move |s| {
-                                s.call_on_name("table", |v: &mut TableView::<Process, BasicColumn>| {
-                                    v.set_items(vector_process2)
-                                });
-                            }))
-                            .unwrap();
-                            cb_sink
-                        .send(Box::new(move |s| {
-                            s.call_on_name("System Information", |v: &mut TextView| {
-                                v.set_content(sys_info_str)
-                            });
-                        }))
-                        .unwrap();
-                        }
-                });
-            search_siv.set_theme(theme);
-            search_siv.run();
-}
-fn main()
-{
-    let handle = std::thread::spawn(|| {
-    let output = Command::new("./external/process_manager_gui").output();
+    tab.end();
+    ///////////
+    wind.make_resizable(true);
+    wind.end();
+    wind.show();
+    dial3.set_value(40);
+    let system = System::new();
+    let (s, r) = app::channel::<Message>();
+    std::thread::spawn(move || loop {
+        app::sleep(0.5);
+        s.send(Message::Increment());
     });
-    show_complete_view();
-    handle.join().unwrap();
+    while app::wait() {
+        if let Some(Message::Increment()) = r.recv() {
+            curr_system.update();
+            let mut count2 = 0;
+            let mut change_color = 0;
+            for mut cpu in &curr_system.cpu_core_usages{
+            inc_frame(&mut dial_list[count2 as usize], &cpu);
+            count2 = count2 + 1;
+            }
+            let mut MemoryPercentage= (curr_system.mem_free as f64/curr_system.mem_total as f64)*100.00;
+            let mut MemoryUsed= (curr_system.mem_used as f64/curr_system.mem_total as f64)*100.00;
+            let mut remaning = 100.00-MemoryUsed-MemoryPercentage;
+            update_sys_info(&mut dial1, &curr_system.cpu_current_usage);
+            update_sys_info2(&mut dial2, & mut MemoryPercentage);
+            // std::thread::sleep(duration);
+            // chart.clear();
+            // for prc in &curr_system.processes
+            // {
+            //     let n: f64 = FromStr::from_str(&prc.cpu).unwrap();
+            //     chart.add(n, &prc.pid.to_string(), FltkColor::from_u32(0xcc9c59+(change_color*1000)));
+            //     change_color = change_color + 1;
+            // }
+            std::thread::sleep(duration);
+            chart.clear();
+            chart2.clear();
+            chart4.clear();
+            let mut countt = 0;
+            for cpu in &curr_system.cpu_core_usages
+            {
+                let n: f64 = FromStr::from_str(&cpu.to_string()).unwrap(); 
+                chart.add(n, &countt.to_string(), FltkColor::from_u32(0xcc9c59+(change_color*5000)));
+                //chart 2 to change: 
+                
+                change_color = change_color + 1;
+                countt = countt + 1;
+            }
+        
+                chart2.add(MemoryPercentage,&MemoryPercentage.to_string(), FltkColor::from_u32(0xcc9c59));
+                chart2.add(MemoryUsed,&MemoryUsed.to_string(),FltkColor::from_u32(0x0000ff));
+                chart2.add(remaning,&remaning.to_string(),FltkColor::from_u32(0x00FFFF));
+                for mut i in 0..12{
+                    chart2.replace(1,MemoryPercentage,&MemoryPercentage.to_string(),FltkColor::from_u32(0xcc9c59));
+                    chart2.replace(2,MemoryUsed,&MemoryUsed.to_string(),FltkColor::from_u32(0x0000ff));
+                    chart2.replace(3,remaning,&remaning.to_string(),FltkColor::from_u32(0x00FFFF));
+                     if(i==11){
+                       i = 0;
+                     }
+                }
+                 for prc in &curr_system.processes
+                 {
+                 let x: f64 = FromStr::from_str(&prc.cpu).unwrap();
+                 chart4.add(x, &prc.pid.to_string(), FltkColor::from_u32(0xcc9c59+(change_color*1000)));
+                 change_color = change_color + 1;
+               
+                }
+    }
+    }
 }
-
-
-
-	

@@ -1,5 +1,5 @@
 [package]
-name = "process_manager"
+name = "process_manager_gui"
 version = "0.1.0"
 edition = "2021"
 
